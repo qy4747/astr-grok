@@ -3,6 +3,7 @@ import importlib.util
 import json
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,13 +30,16 @@ HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
     "astrbot_plugin_grok",
     "shenqing74-cyber",
     "用 /grok 建 Job；/grokbot 交给 Bot；/grok暂存 只入库",
-    "1.2.3",
+    "1.2.4",
 )
 class GrokPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
         self._running: set[asyncio.Task] = set()
+        # QQ 全屏相册会把旧图先作为一条独立消息直接发送。
+        # 这里只保留同会话、同发送者最近的一批图片，下一条 /grok 可一次性消费。
+        self._pending_images: dict[str, tuple[float, Path]] = {}
 
     def _jobs_root(self) -> Path:
         return Path(self.config.get("jobs_root") or r"D:\AI-Inbox\jobs")
@@ -53,6 +57,31 @@ class GrokPlugin(Star):
             return max(0, int(self.config.get("timeout_sec") or 0))
         except (TypeError, ValueError):
             return 0
+
+    def _pending_image_ttl_sec(self) -> int:
+        try:
+            return max(10, int(self.config.get("pending_image_ttl_sec") or 180))
+        except (TypeError, ValueError):
+            return 180
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
+    async def capture_image_only(self, event: AstrMessageEvent):
+        """暂存 QQ 等平台单独发出的裸图片，供紧随其后的 /grok 使用。"""
+        # 同条图文继续走原命令逻辑，不能被这里抢走。
+        if self._is_grok_command(event):
+            return
+        # 只把“纯图片消息”当作待关联图片；普通图文聊天不参与。
+        if str(getattr(event, "message_str", "") or "").strip():
+            return
+        try:
+            count = await self._cache_pending_images(event)
+        except Exception:
+            logger.exception("[grok] cache pending image failed")
+            return
+        if count:
+            logger.info(
+                f"[grok] cached pending images={count} key={self._pending_key(event)}"
+            )
 
     @filter.command("grokbot", priority=3)
     async def cmd_grok_bot(self, event: AstrMessageEvent):
@@ -125,7 +154,7 @@ class GrokPlugin(Star):
         if not ps1.is_file():
             raise FileNotFoundError(f"找不到 run-job.ps1: {ps1}")
 
-    def _extra_request(self, event: AstrMessageEvent) -> str:
+    def _event_text(self, event: AstrMessageEvent) -> str:
         raw = getattr(event.message_obj, "raw_message", None)
         msg = ""
         if raw is not None:
@@ -138,12 +167,90 @@ class GrokPlugin(Star):
                 msg = ""
         if not str(msg).strip():
             msg = event.message_str or ""
-        text = str(msg).strip()
+        return str(msg).strip()
+
+    def _is_grok_command(self, event: AstrMessageEvent) -> bool:
+        lower = self._event_text(event).lower()
+        return any(lower.startswith(prefix) for prefix in CMD_PREFIXES)
+
+    def _extra_request(self, event: AstrMessageEvent) -> str:
+        text = self._event_text(event)
         lower = text.lower()
         for prefix in CMD_PREFIXES:
             if lower.startswith(prefix):
                 return text[len(prefix) :].strip()
         return text
+
+    def _pending_key(self, event: AstrMessageEvent) -> str:
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        sender = ""
+        getter = getattr(event, "get_sender_id", None)
+        if callable(getter):
+            try:
+                sender = str(getter() or "")
+            except Exception:
+                sender = ""
+        if not sender:
+            sender = str(getattr(event, "sender_id", "") or "")
+        return f"{umo}|{sender}"
+
+    def _purge_expired_pending(self) -> None:
+        now = time.monotonic()
+        ttl = self._pending_image_ttl_sec()
+        expired = [
+            key
+            for key, (created_at, _path) in self._pending_images.items()
+            if now - created_at > ttl
+        ]
+        for key in expired:
+            _created_at, path = self._pending_images.pop(key)
+            shutil.rmtree(path, ignore_errors=True)
+
+    async def _cache_pending_images(self, event: AstrMessageEvent) -> int:
+        self._purge_expired_pending()
+        key = self._pending_key(event)
+        pending_root = self._jobs_root() / ".pending_images"
+        pending_root.mkdir(parents=True, exist_ok=True)
+        pending_dir = pending_root / uuid.uuid4().hex
+        pending_dir.mkdir(parents=True, exist_ok=False)
+        saved = await self._save_images(event, pending_dir)
+        if not saved:
+            shutil.rmtree(pending_dir, ignore_errors=True)
+            return 0
+
+        old = self._pending_images.pop(key, None)
+        if old:
+            shutil.rmtree(old[1], ignore_errors=True)
+        self._pending_images[key] = (time.monotonic(), pending_dir)
+        return len(saved)
+
+    def _discard_pending_images(self, event: AstrMessageEvent) -> None:
+        pending = self._pending_images.pop(self._pending_key(event), None)
+        if pending:
+            shutil.rmtree(pending[1], ignore_errors=True)
+
+    def _consume_pending_images(
+        self, event: AstrMessageEvent, job_dir: Path
+    ) -> list[str]:
+        self._purge_expired_pending()
+        pending = self._pending_images.pop(self._pending_key(event), None)
+        if not pending:
+            return []
+        _created_at, pending_dir = pending
+        saved: list[str] = []
+        try:
+            for src in sorted(pending_dir.iterdir()):
+                if not src.is_file() or src.stat().st_size <= 0:
+                    continue
+                ext = src.suffix.lower()
+                if ext not in IMAGE_EXTS:
+                    ext = ".png"
+                name = f"input_{len(saved) + 1:02d}{ext}"
+                shutil.copy2(src, job_dir / name)
+                saved.append(name)
+        finally:
+            shutil.rmtree(pending_dir, ignore_errors=True)
+        return saved
 
     async def _create_job(
         self, event: AstrMessageEvent, extra: str
@@ -156,6 +263,15 @@ class GrokPlugin(Star):
         (job_dir / "logs").mkdir()
 
         inputs = await self._save_images(event, job_dir)
+        if inputs:
+            # 同条消息自带图片时优先使用它，并清掉可能残留的旧图，避免下次串图。
+            self._discard_pending_images(event)
+        else:
+            inputs = self._consume_pending_images(event, job_dir)
+            if inputs:
+                logger.info(
+                    f"[grok] consumed pending images={len(inputs)} key={self._pending_key(event)}"
+                )
         (job_dir / "message.txt").write_text(extra, encoding="utf-8")
         job = {
             "id": job_id,
@@ -178,9 +294,7 @@ class GrokPlugin(Star):
         store_py = self._repo_root() / "workbench" / "store.py"
         if not store_py.is_file():
             raise FileNotFoundError(f"找不到 workbench/store.py: {store_py}")
-        spec = importlib.util.spec_from_file_location(
-            "workbench_store", store_py
-        )
+        spec = importlib.util.spec_from_file_location("workbench_store", store_py)
         if spec is None or spec.loader is None:
             raise ImportError(f"无法加载 {store_py}")
         mod = importlib.util.module_from_spec(spec)
