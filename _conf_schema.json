@@ -21,5 +21,11 @@
     "type": "int",
     "hint": "0 表示不限时",
     "default": 0
+  },
+  "pending_image_ttl_sec": {
+    "description": "旧图等待 /grok 的缓存时间（秒）",
+    "type": "int",
+    "hint": "QQ 全屏相册先发送旧图后，在此时间内发送 /grok 会自动关联；默认 180 秒",
+    "default": 180
   }
 }
