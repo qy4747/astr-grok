@@ -1,0 +1,25 @@
+{
+  "jobs_root": {
+    "description": "Job 根目录",
+    "type": "string",
+    "hint": "每个任务会在此目录下新建一个子目录",
+    "default": "D:\\AI-Inbox\\jobs"
+  },
+  "repo_root": {
+    "description": "Grok 仓库根目录",
+    "type": "string",
+    "hint": "传给 grok --cwd，对应 H:\\GROK资源整合",
+    "default": "H:\\GROK资源整合"
+  },
+  "grok_exe": {
+    "description": "grok.exe 路径",
+    "type": "string",
+    "default": "C:\\Users\\shenq\\.grok\\bin\\grok.exe"
+  },
+  "timeout_sec": {
+    "description": "单次 Job 超时（秒）",
+    "type": "int",
+    "hint": "0 表示不限时",
+    "default": 0
+  }
+}
