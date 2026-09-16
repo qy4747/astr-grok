@@ -24,22 +24,24 @@ UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
+INPUT_INDEX_RE = re.compile(r"^input_(\d+)$")
 
 
 @register(
     "astrbot_plugin_grok",
     "shenqing74-cyber",
     "用 /grok 建 Job；/grokbot 交给 Bot；/grok暂存 只入库",
-    "1.2.4",
+    "1.2.5",
 )
 class GrokPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
         self._running: set[asyncio.Task] = set()
-        # QQ 全屏相册会把旧图先作为一条独立消息直接发送。
-        # 这里只保留同会话、同发送者最近的一批图片，下一条 /grok 可一次性消费。
+        # QQ 全屏相册会把旧图先作为独立消息发送。
+        # 同会话、同发送者在 TTL 内连续发出的纯图片会累加到同一 pending 批次。
         self._pending_images: dict[str, tuple[float, Path]] = {}
+        self._pending_lock = asyncio.Lock()
 
     def _jobs_root(self) -> Path:
         return Path(self.config.get("jobs_root") or r"D:\AI-Inbox\jobs")
@@ -80,7 +82,7 @@ class GrokPlugin(Star):
             return
         if count:
             logger.info(
-                f"[grok] cached pending images={count} key={self._pending_key(event)}"
+                f"[grok] cached pending images=+{count} key={self._pending_key(event)}"
             )
 
     @filter.command("grokbot", priority=3)
@@ -124,13 +126,16 @@ class GrokPlugin(Star):
 
     @filter.command("grok", priority=1)
     async def cmd_grok(self, event: AstrMessageEvent):
-        """建 Job 并立刻调研: /grok [附加需求]，可附带图片。入账由 Grok MCP 负责。"""
+        """建 Job、预写 Workbench，并立刻调研: /grok [附加需求]，可附带图片。"""
         extra = self._extra_request(event)
         try:
             self._require_runner()
             job, job_dir = await self._create_job(event, extra)
+            # 与 /grokbot 对齐：CLI 真正启动前先让 Web/Workbench 看得到任务。
+            self._upsert_job(job, job_dir)
+            self._upsert_job(job, job_dir, status="running")
         except Exception as e:
-            logger.exception("[grok] create job failed")
+            logger.exception("[grok] create or register job failed")
             yield event.plain_result(f"建 Job 失败: {e}")
             event.stop_event()
             return
@@ -207,22 +212,28 @@ class GrokPlugin(Star):
             shutil.rmtree(path, ignore_errors=True)
 
     async def _cache_pending_images(self, event: AstrMessageEvent) -> int:
-        self._purge_expired_pending()
-        key = self._pending_key(event)
-        pending_root = self._jobs_root() / ".pending_images"
-        pending_root.mkdir(parents=True, exist_ok=True)
-        pending_dir = pending_root / uuid.uuid4().hex
-        pending_dir.mkdir(parents=True, exist_ok=False)
-        saved = await self._save_images(event, pending_dir)
-        if not saved:
-            shutil.rmtree(pending_dir, ignore_errors=True)
-            return 0
+        async with self._pending_lock:
+            self._purge_expired_pending()
+            key = self._pending_key(event)
+            pending_root = self._jobs_root() / ".pending_images"
+            pending_root.mkdir(parents=True, exist_ok=True)
 
-        old = self._pending_images.pop(key, None)
-        if old:
-            shutil.rmtree(old[1], ignore_errors=True)
-        self._pending_images[key] = (time.monotonic(), pending_dir)
-        return len(saved)
+            existing = self._pending_images.get(key)
+            if existing and existing[1].is_dir():
+                pending_dir = existing[1]
+            else:
+                pending_dir = pending_root / uuid.uuid4().hex
+                pending_dir.mkdir(parents=True, exist_ok=False)
+
+            saved = await self._save_images(event, pending_dir)
+            if not saved:
+                if existing is None:
+                    shutil.rmtree(pending_dir, ignore_errors=True)
+                return 0
+
+            # 每次成功追加图片都刷新 TTL；不再删除此前同批图片。
+            self._pending_images[key] = (time.monotonic(), pending_dir)
+            return len(saved)
 
     def _discard_pending_images(self, event: AstrMessageEvent) -> None:
         pending = self._pending_images.pop(self._pending_key(event), None)
@@ -350,6 +361,13 @@ class GrokPlugin(Star):
     ) -> list[str]:
         saved: list[str] = []
         seen: set[str] = set()
+        base_index = 0
+        for existing in job_dir.iterdir():
+            if not existing.is_file():
+                continue
+            match = INPUT_INDEX_RE.match(existing.stem)
+            if match:
+                base_index = max(base_index, int(match.group(1)))
 
         def is_dup(keys: set[str]) -> bool:
             return bool(keys & seen)
@@ -357,13 +375,16 @@ class GrokPlugin(Star):
         def remember(keys: set[str]) -> None:
             seen.update(k for k in keys if k)
 
+        def next_name(ext: str) -> str:
+            return f"input_{base_index + len(saved) + 1:02d}{ext}"
+
         async def persist_file(src: Path) -> bool:
             if not src.is_file() or src.stat().st_size <= 0:
                 return False
             ext = src.suffix.lower()
             if ext not in IMAGE_EXTS:
                 ext = ".png"
-            name = f"input_{len(saved) + 1:02d}{ext}"
+            name = next_name(ext)
             shutil.copy2(src, job_dir / name)
             saved.append(name)
             remember({str(src.resolve()).lower()})
@@ -375,7 +396,7 @@ class GrokPlugin(Star):
             data, ext = await self._download_image(url)
             if not data:
                 return False
-            name = f"input_{len(saved) + 1:02d}{ext}"
+            name = next_name(ext)
             (job_dir / name).write_bytes(data)
             saved.append(name)
             remember(self._identity_keys(url))
