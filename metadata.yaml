@@ -1,6 +1,6 @@
 name: astrbot_plugin_grok
 display_name: Grok 资源调研
 short_desc: /grok 交给 Grok；/grokbot 交给 Bot；/grok暂存 只入库
-desc: /grok 走 Grok CLI；/grokbot 直接写库并调用 Workbench webhook；/grok暂存 只保存图文；支持 QQ 旧图先发送后由下一条 /grok 自动关联。
-version: 1.2.4
+desc: /grok 走 Grok CLI 并预写 Workbench；/grokbot 直接写库并调用 Workbench webhook；/grok暂存 只保存图文；支持 QQ 旧图连续发送后由下一条 /grok 批量关联。
+version: 1.2.5
 author: shenqing74-cyber
