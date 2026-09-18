@@ -377,14 +377,13 @@ class GrokPlugin(Star):
                 job, job_dir = await self._create_job_from_staging(extra, staging_dir)
             except Exception as e:
                 error = e
+                logger.exception(
+                    f"[grok] finalize awaiting failed key={key} mode={mode}"
+                )
             finally:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
         if error is not None:
-            logger.exception(
-                f"[grok] finalize awaiting failed key={key} mode={mode}",
-                exc_info=error,
-            )
             if mode == "bot":
                 await self._send(umo, f"Bot 调研启动失败: {error}")
             else:
