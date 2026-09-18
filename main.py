@@ -31,7 +31,7 @@ INPUT_INDEX_RE = re.compile(r"^input_(\d+)$")
     "astrbot_plugin_grok",
     "shenqing74-cyber",
     "用 /grok 建 Job；/grokbot 交给 Bot；/grok暂存 只入库",
-    "1.2.6",
+    "1.2.7",
 )
 class GrokPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -104,18 +104,23 @@ class GrokPlugin(Star):
         key = self._pending_key(event)
         awaiting = self._awaiting.get(key)
         if awaiting and not awaiting.get("done"):
-            # 命令先发等图中：写入 staging，不要再进旧 pending。
+            # 命令先发等图中：append / finalize / cancel 共用同一个 state lock，
+            # 避免下载图片让出事件循环时 staging 被提前删除。
             try:
-                staging: Path = awaiting["staging_dir"]
-                staging.mkdir(parents=True, exist_ok=True)
-                saved = await self._save_images(event, staging)
+                async with awaiting["lock"]:
+                    if self._awaiting.get(key) is not awaiting or awaiting.get("done"):
+                        return
+                    staging: Path = awaiting["staging_dir"]
+                    staging.mkdir(parents=True, exist_ok=True)
+                    saved = await self._save_images(event, staging)
+                    total_files = sum(1 for p in staging.iterdir() if p.is_file())
             except Exception:
                 logger.exception("[grok] append awaiting image failed")
                 return
             if saved:
                 logger.info(
-                    f"[grok] awaiting images=+{len(saved)} key={key} total_files="
-                    f"{sum(1 for p in staging.iterdir() if p.is_file())}"
+                    f"[grok] awaiting images=+{len(saved)} key={key} "
+                    f"total_files={total_files}"
                 )
                 self._arm_await_debounce(key)
                 stop = getattr(event, "stop_event", None)
@@ -158,12 +163,12 @@ class GrokPlugin(Star):
         """统一入口：同条有图 / 已有 pending / 关闭等图 → 立刻建 Job；否则进入等图。"""
         extra = self._extra_request(event)
         key = self._pending_key(event)
-        # 同一 key 新命令覆盖旧等图窗口。
-        self._cancel_awaiting(key)
+        # 同一 key 新命令覆盖旧等图窗口；取消必须等正在写 staging 的图片落完盘。
+        await self._cancel_awaiting(key)
 
         await_sec = self._await_image_sec()
-        has_img = self._event_has_image_segments(event)
-        has_pending = self._has_pending_images(event)
+        has_img = self._event_has_images(event)
+        has_pending = await self._has_pending_images(event)
         if has_img or has_pending or await_sec <= 0:
             try:
                 if mode == "cli":
@@ -195,6 +200,7 @@ class GrokPlugin(Star):
             "umo": event.unified_msg_origin,
             "staging_dir": staging_dir,
             "done": False,
+            "lock": asyncio.Lock(),
             "deadline_task": None,
             "debounce_task": None,
         }
@@ -262,8 +268,8 @@ class GrokPlugin(Star):
             sender = str(getattr(event, "sender_id", "") or "")
         return f"{umo}|{sender}"
 
-    def _event_has_image_segments(self, event: AstrMessageEvent) -> bool:
-        """当前消息链是否已带图片（含引用链内 Image / 图片文件）。"""
+    def _event_has_images(self, event: AstrMessageEvent) -> bool:
+        """是否存在 _save_images 能实际保存的图片来源。"""
         for seg in self._iter_segments(event):
             if isinstance(seg, Image):
                 return True
@@ -277,32 +283,47 @@ class GrokPlugin(Star):
                     if item
                 ):
                     return True
+
+        # 必须和 _save_images 的 raw attachments 兜底保持一致。
+        for item in self._attachment_items(event):
+            _keys, url = self._keys_from_attachment(item)
+            if url:
+                return True
         return False
 
-    def _has_pending_images(self, event: AstrMessageEvent) -> bool:
-        self._purge_expired_pending()
-        pending = self._pending_images.get(self._pending_key(event))
-        if not pending:
-            return False
-        path = pending[1]
-        if not path.is_dir():
-            return False
-        return any(
-            p.is_file() and p.stat().st_size > 0 for p in path.iterdir()
-        )
+    async def _has_pending_images(self, event: AstrMessageEvent) -> bool:
+        async with self._pending_lock:
+            self._purge_expired_pending()
+            pending = self._pending_images.get(self._pending_key(event))
+            if not pending:
+                return False
+            path = pending[1]
+            if not path.is_dir():
+                return False
+            return any(
+                p.is_file() and p.stat().st_size > 0 for p in path.iterdir()
+            )
 
-    def _cancel_awaiting(self, key: str) -> None:
-        state = self._awaiting.pop(key, None)
+    async def _cancel_awaiting(self, key: str) -> None:
+        state = self._awaiting.get(key)
         if not state:
             return
-        state["done"] = True
-        for name in ("deadline_task", "debounce_task"):
-            task = state.get(name)
-            if task is not None and not task.done():
-                task.cancel()
-        staging = state.get("staging_dir")
-        if staging:
-            shutil.rmtree(staging, ignore_errors=True)
+        async with state["lock"]:
+            if self._awaiting.get(key) is not state:
+                return
+            state["done"] = True
+            for name in ("deadline_task", "debounce_task"):
+                task = state.get(name)
+                if (
+                    task is not None
+                    and not task.done()
+                    and task is not asyncio.current_task()
+                ):
+                    task.cancel()
+            self._awaiting.pop(key, None)
+            staging = state.get("staging_dir")
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
 
     def _arm_await_debounce(self, key: str) -> None:
         state = self._awaiting.get(key)
@@ -324,35 +345,61 @@ class GrokPlugin(Star):
 
     async def _finalize_awaiting(self, key: str) -> None:
         state = self._awaiting.get(key)
-        if not state or state.get("done"):
+        if not state:
             return
-        # 只允许一次 finalize；随后取消兄弟定时器。
-        state["done"] = True
-        for name in ("deadline_task", "debounce_task"):
-            task = state.get(name)
-            if task is not None and not task.done() and task is not asyncio.current_task():
-                task.cancel()
 
-        mode = state["mode"]
-        extra = state["extra"]
-        umo = state["umo"]
-        staging_dir: Path = state["staging_dir"]
-        self._awaiting.pop(key, None)
+        job = job_dir = None
+        error = None
+        async with state["lock"]:
+            if self._awaiting.get(key) is not state or state.get("done"):
+                return
+
+            # 只允许一次 finalize；append 完成后再复制 staging。
+            state["done"] = True
+            for name in ("deadline_task", "debounce_task"):
+                task = state.get(name)
+                if (
+                    task is not None
+                    and not task.done()
+                    and task is not asyncio.current_task()
+                ):
+                    task.cancel()
+
+            mode = state["mode"]
+            extra = state["extra"]
+            umo = state["umo"]
+            staging_dir: Path = state["staging_dir"]
+            self._awaiting.pop(key, None)
+
+            try:
+                if mode == "cli":
+                    self._require_runner()
+                job, job_dir = await self._create_job_from_staging(extra, staging_dir)
+            except Exception as e:
+                error = e
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+        if error is not None:
+            logger.exception(
+                f"[grok] finalize awaiting failed key={key} mode={mode}",
+                exc_info=error,
+            )
+            if mode == "bot":
+                await self._send(umo, f"Bot 调研启动失败: {error}")
+            else:
+                await self._send(umo, f"建 Job 失败: {error}")
+            return
 
         try:
-            if mode == "cli":
-                self._require_runner()
-            job, job_dir = await self._create_job_from_staging(extra, staging_dir)
             reply = await self._dispatch_job(mode, job, job_dir, umo)
             await self._send(umo, reply)
         except Exception as e:
-            logger.exception(f"[grok] finalize awaiting failed key={key} mode={mode}")
+            logger.exception(f"[grok] finalize awaiting dispatch failed key={key} mode={mode}")
             if mode == "bot":
                 await self._send(umo, f"Bot 调研启动失败: {e}")
             else:
                 await self._send(umo, f"建 Job 失败: {e}")
-        finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
 
     async def _dispatch_job(
         self, mode: str, job: dict, job_dir: Path, umo: str
@@ -416,33 +463,35 @@ class GrokPlugin(Star):
             self._pending_images[key] = (time.monotonic(), pending_dir)
             return len(saved)
 
-    def _discard_pending_images(self, event: AstrMessageEvent) -> None:
-        pending = self._pending_images.pop(self._pending_key(event), None)
-        if pending:
-            shutil.rmtree(pending[1], ignore_errors=True)
+    async def _discard_pending_images(self, event: AstrMessageEvent) -> None:
+        async with self._pending_lock:
+            pending = self._pending_images.pop(self._pending_key(event), None)
+            if pending:
+                shutil.rmtree(pending[1], ignore_errors=True)
 
-    def _consume_pending_images(
+    async def _consume_pending_images(
         self, event: AstrMessageEvent, job_dir: Path
     ) -> list[str]:
-        self._purge_expired_pending()
-        pending = self._pending_images.pop(self._pending_key(event), None)
-        if not pending:
-            return []
-        _created_at, pending_dir = pending
-        saved: list[str] = []
-        try:
-            for src in sorted(pending_dir.iterdir()):
-                if not src.is_file() or src.stat().st_size <= 0:
-                    continue
-                ext = src.suffix.lower()
-                if ext not in IMAGE_EXTS:
-                    ext = ".png"
-                name = f"input_{len(saved) + 1:02d}{ext}"
-                shutil.copy2(src, job_dir / name)
-                saved.append(name)
-        finally:
-            shutil.rmtree(pending_dir, ignore_errors=True)
-        return saved
+        async with self._pending_lock:
+            self._purge_expired_pending()
+            pending = self._pending_images.pop(self._pending_key(event), None)
+            if not pending:
+                return []
+            _created_at, pending_dir = pending
+            saved: list[str] = []
+            try:
+                for src in sorted(pending_dir.iterdir()):
+                    if not src.is_file() or src.stat().st_size <= 0:
+                        continue
+                    ext = src.suffix.lower()
+                    if ext not in IMAGE_EXTS:
+                        ext = ".png"
+                    name = f"input_{len(saved) + 1:02d}{ext}"
+                    shutil.copy2(src, job_dir / name)
+                    saved.append(name)
+            finally:
+                shutil.rmtree(pending_dir, ignore_errors=True)
+            return saved
 
     def _new_job_dir(self) -> tuple[str, str, Path, datetime]:
         now = datetime.now(TZ)
@@ -506,9 +555,9 @@ class GrokPlugin(Star):
         inputs = await self._save_images(event, job_dir)
         if inputs:
             # 同条消息自带图片时优先使用它，并清掉可能残留的旧图，避免下次串图。
-            self._discard_pending_images(event)
+            await self._discard_pending_images(event)
         else:
-            inputs = self._consume_pending_images(event, job_dir)
+            inputs = await self._consume_pending_images(event, job_dir)
             if inputs:
                 logger.info(
                     f"[grok] consumed pending images={len(inputs)} key={self._pending_key(event)}"
