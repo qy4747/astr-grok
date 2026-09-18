@@ -60,7 +60,7 @@ async def main() -> None:
         )
         other_dir = Path(tmp) / "other-job"
         other_dir.mkdir()
-        assert plugin._consume_pending_images(other_event, other_dir) == []
+        assert await plugin._consume_pending_images(other_event, other_dir) == []
         assert len(plugin._pending_images) == 1
 
         # 同一会话、同一发送者的下一条 /grok 一次性消费全部旧图。
@@ -79,6 +79,38 @@ async def main() -> None:
         assert (job_dir / "input_01.jpg").read_bytes() == b"image-one"
         assert (job_dir / "input_02.jpg").read_bytes() == b"image-two"
         assert (job_dir / "input_03.jpg").read_bytes() == b"image-three"
+        assert plugin._pending_images == {}
+
+        # cache 正在下载时 consume 必须等锁，不能先删 pending 目录。
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_download(url: str):
+            started.set()
+            await release.wait()
+            return b"image-race", ".jpg"
+
+        plugin._download_image = slow_download
+        race_event = make_event(
+            sender="10001",
+            umo="aiocqhttp:FriendMessage:10001",
+            messages=[Image.fromURL("https://example.test/race.jpg")],
+        )
+        cache_task = asyncio.create_task(plugin._cache_pending_images(race_event))
+        await started.wait()
+
+        race_dir = Path(tmp) / "race-job"
+        race_dir.mkdir()
+        consume_task = asyncio.create_task(
+            plugin._consume_pending_images(race_event, race_dir)
+        )
+        await asyncio.sleep(0)
+        assert not consume_task.done()
+
+        release.set()
+        assert await cache_task == 1
+        assert await consume_task == ["input_01.jpg"]
+        assert (race_dir / "input_01.jpg").read_bytes() == b"image-race"
         assert plugin._pending_images == {}
 
 
