@@ -1,31 +1,44 @@
 {
   "jobs_root": {
-    "description": "Job 根目录",
+    "description": "Job 目录根路径",
     "type": "string",
-    "hint": "每个任务会在此目录下新建一个子目录",
+    "hint": "每条命令会在此下创建 job-<时间>-<短id>/",
     "default": "D:\\AI-Inbox\\jobs"
   },
   "repo_root": {
-    "description": "Grok 仓库根目录",
+    "description": "GROK 资源整合仓库根目录",
     "type": "string",
-    "hint": "传给 grok --cwd，对应 H:\\GROK资源整合",
+    "hint": "需包含 scripts/run-job.ps1 与 workbench/store.py",
     "default": "H:\\GROK资源整合"
   },
   "grok_exe": {
     "description": "grok.exe 路径",
     "type": "string",
+    "hint": "仅 /grok CLI 模式需要",
     "default": "C:\\Users\\shenq\\.grok\\bin\\grok.exe"
   },
   "timeout_sec": {
-    "description": "单次 Job 超时（秒）",
+    "description": "CLI 调研超时秒数（0=不限制）",
     "type": "int",
-    "hint": "0 表示不限时",
+    "hint": "仅影响 /grok 本地 CLI",
     "default": 0
   },
   "pending_image_ttl_sec": {
-    "description": "旧图等待 /grok 的缓存时间（秒）",
+    "description": "图先命令后：纯图片 pending 批次 TTL（秒）",
     "type": "int",
-    "hint": "QQ 全屏相册先发送旧图后，在此时间内发送 /grok 会自动关联；默认 180 秒",
+    "hint": "同会话同发送者累加；最少 10",
     "default": 180
+  },
+  "await_image_sec": {
+    "description": "命令先发再等图：硬超时秒数（0=关闭此模式）",
+    "type": "int",
+    "hint": "收到 /grok|/grokbot|/grok暂存 且当前无图、也无 pending 时进入等图；超时后按已收到图片（可为空）建 Job",
+    "default": 12
+  },
+  "await_image_debounce_ms": {
+    "description": "命令先发再等图：末张图后的防抖毫秒",
+    "type": "int",
+    "hint": "默认 1500（1.5 秒）；代码内换算为秒并夹在 0.3～await_image_sec 之间",
+    "default": 1500
   }
 }

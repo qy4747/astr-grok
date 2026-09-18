@@ -31,7 +31,7 @@ INPUT_INDEX_RE = re.compile(r"^input_(\d+)$")
     "astrbot_plugin_grok",
     "shenqing74-cyber",
     "用 /grok 建 Job；/grokbot 交给 Bot；/grok暂存 只入库",
-    "1.2.6",
+    "1.2.5",
 )
 class GrokPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -42,8 +42,6 @@ class GrokPlugin(Star):
         # 同会话、同发送者在 TTL 内连续发出的纯图片会累加到同一 pending 批次。
         self._pending_images: dict[str, tuple[float, Path]] = {}
         self._pending_lock = asyncio.Lock()
-        # 命令先发、图片后到：等图窗口（按 umo|sender）。
-        self._awaiting: dict[str, dict] = {}
 
     def _jobs_root(self) -> Path:
         return Path(self.config.get("jobs_root") or r"D:\AI-Inbox\jobs")
@@ -68,29 +66,6 @@ class GrokPlugin(Star):
         except (TypeError, ValueError):
             return 180
 
-    def _await_image_sec(self) -> int:
-        """命令后等图的硬超时秒数；0 表示关闭命令先发模式。"""
-        try:
-            return max(0, int(self.config.get("await_image_sec") if self.config.get("await_image_sec") is not None else 12))
-        except (TypeError, ValueError):
-            return 12
-
-    def _await_image_debounce_sec(self) -> float:
-        """末张图后的防抖秒数；下限 0.3，且不超过 await_image_sec。"""
-        try:
-            ms = int(
-                self.config.get("await_image_debounce_ms")
-                if self.config.get("await_image_debounce_ms") is not None
-                else 1500
-            )
-        except (TypeError, ValueError):
-            ms = 1500
-        sec = max(0.3, ms / 1000.0)
-        await_sec = self._await_image_sec()
-        if await_sec > 0:
-            sec = min(sec, float(await_sec))
-        return sec
-
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def capture_image_only(self, event: AstrMessageEvent):
         """暂存 QQ 等平台单独发出的裸图片，供紧随其后的 /grok 使用。"""
@@ -100,32 +75,6 @@ class GrokPlugin(Star):
         # 只把“纯图片消息”当作待关联图片；普通图文聊天不参与。
         if str(getattr(event, "message_str", "") or "").strip():
             return
-
-        key = self._pending_key(event)
-        awaiting = self._awaiting.get(key)
-        if awaiting and not awaiting.get("done"):
-            # 命令先发等图中：写入 staging，不要再进旧 pending。
-            try:
-                staging: Path = awaiting["staging_dir"]
-                staging.mkdir(parents=True, exist_ok=True)
-                saved = await self._save_images(event, staging)
-            except Exception:
-                logger.exception("[grok] append awaiting image failed")
-                return
-            if saved:
-                logger.info(
-                    f"[grok] awaiting images=+{len(saved)} key={key} total_files="
-                    f"{sum(1 for p in staging.iterdir() if p.is_file())}"
-                )
-                self._arm_await_debounce(key)
-                stop = getattr(event, "stop_event", None)
-                if callable(stop):
-                    try:
-                        stop()
-                    except Exception:
-                        pass
-            return
-
         try:
             count = await self._cache_pending_images(event)
         except Exception:
@@ -139,80 +88,68 @@ class GrokPlugin(Star):
     @filter.command("grokbot", priority=3)
     async def cmd_grok_bot(self, event: AstrMessageEvent):
         """建 Job、直接写库并通过 Workbench webhook 唤醒资源工人。"""
-        async for item in self._begin_command(event, "bot"):
-            yield item
+        extra = self._extra_request(event)
+        job = None
+        try:
+            job, job_dir = await self._create_job(event, extra)
+            self._upsert_job(job, job_dir)
+            self._upsert_job(job, job_dir, status="running")
+            try:
+                await self._post_bot_webhook(job, job_dir)
+            except Exception:
+                self._upsert_job(job, job_dir)
+                raise
+        except Exception as e:
+            logger.exception("[grokbot] create or dispatch job failed")
+            yield event.plain_result(f"Bot 调研启动失败: {e}")
+            event.stop_event()
+            return
+
+        yield event.plain_result(f"已交给 Bot\n{job['id']}")
+        event.stop_event()
 
     @filter.command("grok暂存", priority=2)
     async def cmd_grok_stash(self, event: AstrMessageEvent):
         """只入库: /grok暂存 [附加需求]，可附带图片。不排队调研，插件直接写库。"""
-        async for item in self._begin_command(event, "stash"):
-            yield item
+        extra = self._extra_request(event)
+        try:
+            job, job_dir = await self._create_job(event, extra)
+            self._upsert_job(job, job_dir)
+        except Exception as e:
+            logger.exception("[grok] stash job failed")
+            yield event.plain_result(f"建 Job 失败: {e}")
+            event.stop_event()
+            return
+
+        yield event.plain_result(f"已暂存\n{job['id']}")
+        event.stop_event()
 
     @filter.command("grok", priority=1)
     async def cmd_grok(self, event: AstrMessageEvent):
         """建 Job、预写 Workbench，并立刻调研: /grok [附加需求]，可附带图片。"""
-        async for item in self._begin_command(event, "cli"):
-            yield item
-
-    async def _begin_command(self, event: AstrMessageEvent, mode: str):
-        """统一入口：同条有图 / 已有 pending / 关闭等图 → 立刻建 Job；否则进入等图。"""
         extra = self._extra_request(event)
-        key = self._pending_key(event)
-        # 同一 key 新命令覆盖旧等图窗口。
-        self._cancel_awaiting(key)
-
-        await_sec = self._await_image_sec()
-        has_img = self._event_has_image_segments(event)
-        has_pending = self._has_pending_images(event)
-        if has_img or has_pending or await_sec <= 0:
-            try:
-                if mode == "cli":
-                    self._require_runner()
-                job, job_dir = await self._create_job(event, extra)
-                reply = await self._dispatch_job(
-                    mode, job, job_dir, event.unified_msg_origin
-                )
-            except Exception as e:
-                logger.exception(f"[grok] {mode} create or dispatch failed")
-                if mode == "bot":
-                    yield event.plain_result(f"Bot 调研启动失败: {e}")
-                else:
-                    yield event.plain_result(f"建 Job 失败: {e}")
-                event.stop_event()
-                return
-            yield event.plain_result(reply)
+        try:
+            self._require_runner()
+            job, job_dir = await self._create_job(event, extra)
+            # 与 /grokbot 对齐：CLI 真正启动前先让 Web/Workbench 看得到任务。
+            self._upsert_job(job, job_dir)
+            self._upsert_job(job, job_dir, status="running")
+        except Exception as e:
+            logger.exception("[grok] create or register job failed")
+            yield event.plain_result(f"建 Job 失败: {e}")
             event.stop_event()
             return
 
-        # 命令先发：只登记等图，不建 Job / 不 upsert / 不 webhook / 不 CLI。
-        pending_root = self._jobs_root() / ".awaiting_images"
-        pending_root.mkdir(parents=True, exist_ok=True)
-        staging_dir = pending_root / uuid.uuid4().hex
-        staging_dir.mkdir(parents=True, exist_ok=False)
-        state = {
-            "mode": mode,
-            "extra": extra,
-            "umo": event.unified_msg_origin,
-            "staging_dir": staging_dir,
-            "done": False,
-            "deadline_task": None,
-            "debounce_task": None,
-        }
-        self._awaiting[key] = state
-
-        async def _deadline():
-            try:
-                await asyncio.sleep(await_sec)
-                await self._finalize_awaiting(key)
-            except asyncio.CancelledError:
-                return
-
-        state["deadline_task"] = asyncio.create_task(_deadline())
-        logger.info(
-            f"[grok] awaiting images key={key} mode={mode} sec={await_sec}"
-        )
-        yield event.plain_result(f"等图中（{await_sec}秒）…")
+        yield event.plain_result("已接收")
         event.stop_event()
+
+        task = asyncio.create_task(
+            self._run_job(
+                event.unified_msg_origin, job["id"], job["session_id"], job_dir
+            )
+        )
+        self._running.add(task)
+        task.add_done_callback(self._running.discard)
 
     def _require_runner(self) -> None:
         grok_exe = self._grok_exe()
@@ -261,124 +198,6 @@ class GrokPlugin(Star):
         if not sender:
             sender = str(getattr(event, "sender_id", "") or "")
         return f"{umo}|{sender}"
-
-    def _event_has_image_segments(self, event: AstrMessageEvent) -> bool:
-        """当前消息链是否已带图片（含引用链内 Image / 图片文件）。"""
-        for seg in self._iter_segments(event):
-            if isinstance(seg, Image):
-                return True
-            if isinstance(seg, File):
-                name = str(getattr(seg, "name", "") or "")
-                file_path = str(getattr(seg, "file_", "") or "")
-                url = str(getattr(seg, "url", "") or "")
-                if any(
-                    item.lower().endswith(tuple(IMAGE_EXTS))
-                    for item in (name, file_path, url)
-                    if item
-                ):
-                    return True
-        return False
-
-    def _has_pending_images(self, event: AstrMessageEvent) -> bool:
-        self._purge_expired_pending()
-        pending = self._pending_images.get(self._pending_key(event))
-        if not pending:
-            return False
-        path = pending[1]
-        if not path.is_dir():
-            return False
-        return any(
-            p.is_file() and p.stat().st_size > 0 for p in path.iterdir()
-        )
-
-    def _cancel_awaiting(self, key: str) -> None:
-        state = self._awaiting.pop(key, None)
-        if not state:
-            return
-        state["done"] = True
-        for name in ("deadline_task", "debounce_task"):
-            task = state.get(name)
-            if task is not None and not task.done():
-                task.cancel()
-        staging = state.get("staging_dir")
-        if staging:
-            shutil.rmtree(staging, ignore_errors=True)
-
-    def _arm_await_debounce(self, key: str) -> None:
-        state = self._awaiting.get(key)
-        if not state or state.get("done"):
-            return
-        old = state.get("debounce_task")
-        if old is not None and not old.done():
-            old.cancel()
-        delay = self._await_image_debounce_sec()
-
-        async def _fire():
-            try:
-                await asyncio.sleep(delay)
-                await self._finalize_awaiting(key)
-            except asyncio.CancelledError:
-                return
-
-        state["debounce_task"] = asyncio.create_task(_fire())
-
-    async def _finalize_awaiting(self, key: str) -> None:
-        state = self._awaiting.get(key)
-        if not state or state.get("done"):
-            return
-        # 只允许一次 finalize；随后取消兄弟定时器。
-        state["done"] = True
-        for name in ("deadline_task", "debounce_task"):
-            task = state.get(name)
-            if task is not None and not task.done() and task is not asyncio.current_task():
-                task.cancel()
-
-        mode = state["mode"]
-        extra = state["extra"]
-        umo = state["umo"]
-        staging_dir: Path = state["staging_dir"]
-        self._awaiting.pop(key, None)
-
-        try:
-            if mode == "cli":
-                self._require_runner()
-            job, job_dir = await self._create_job_from_staging(extra, staging_dir)
-            reply = await self._dispatch_job(mode, job, job_dir, umo)
-            await self._send(umo, reply)
-        except Exception as e:
-            logger.exception(f"[grok] finalize awaiting failed key={key} mode={mode}")
-            if mode == "bot":
-                await self._send(umo, f"Bot 调研启动失败: {e}")
-            else:
-                await self._send(umo, f"建 Job 失败: {e}")
-        finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-
-    async def _dispatch_job(
-        self, mode: str, job: dict, job_dir: Path, umo: str
-    ) -> str:
-        """按模式入库 / webhook / 拉起 CLI，返回即时回执文案。"""
-        if mode == "bot":
-            self._upsert_job(job, job_dir)
-            self._upsert_job(job, job_dir, status="running")
-            try:
-                await self._post_bot_webhook(job, job_dir)
-            except Exception:
-                self._upsert_job(job, job_dir)
-                raise
-            return f"已交给 Bot\n{job['id']}"
-        if mode == "stash":
-            self._upsert_job(job, job_dir)
-            return f"已暂存\n{job['id']}"
-        # cli / grok
-        self._upsert_job(job, job_dir)
-        self._upsert_job(job, job_dir, status="running")
-        task = asyncio.create_task(
-            self._run_job(umo, job["id"], job["session_id"], job_dir)
-        )
-        self._running.add(task)
-        task.add_done_callback(self._running.discard)
-        return "已接收"
 
     def _purge_expired_pending(self) -> None:
         now = time.monotonic()
@@ -444,24 +263,26 @@ class GrokPlugin(Star):
             shutil.rmtree(pending_dir, ignore_errors=True)
         return saved
 
-    def _new_job_dir(self) -> tuple[str, str, Path, datetime]:
+    async def _create_job(
+        self, event: AstrMessageEvent, extra: str
+    ) -> tuple[dict, Path]:
         now = datetime.now(TZ)
         job_id = f"job-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         session_id = str(uuid.uuid4())
         job_dir = self._jobs_root() / job_id
         job_dir.mkdir(parents=True, exist_ok=False)
         (job_dir / "logs").mkdir()
-        return job_id, session_id, job_dir, now
 
-    def _write_job(
-        self,
-        job_id: str,
-        session_id: str,
-        job_dir: Path,
-        now: datetime,
-        extra: str,
-        inputs: list[str],
-    ) -> dict:
+        inputs = await self._save_images(event, job_dir)
+        if inputs:
+            # 同条消息自带图片时优先使用它，并清掉可能残留的旧图，避免下次串图。
+            self._discard_pending_images(event)
+        else:
+            inputs = self._consume_pending_images(event, job_dir)
+            if inputs:
+                logger.info(
+                    f"[grok] consumed pending images={len(inputs)} key={self._pending_key(event)}"
+                )
         (job_dir / "message.txt").write_text(extra, encoding="utf-8")
         job = {
             "id": job_id,
@@ -478,51 +299,6 @@ class GrokPlugin(Star):
             encoding="utf-8",
         )
         logger.info(f"[grok] job={job_id} session={session_id} images={len(inputs)}")
-        return job
-
-    def _copy_staging_inputs(
-        self, staging_dir: Path | None, job_dir: Path
-    ) -> list[str]:
-        """把等图 staging 目录中的图片复制进 Job（可为空 = 纯文本 Job）。"""
-        if staging_dir is None or not staging_dir.is_dir():
-            return []
-        saved: list[str] = []
-        for src in sorted(staging_dir.iterdir()):
-            if not src.is_file() or src.stat().st_size <= 0:
-                continue
-            ext = src.suffix.lower()
-            if ext not in IMAGE_EXTS:
-                ext = ".png"
-            name = f"input_{len(saved) + 1:02d}{ext}"
-            shutil.copy2(src, job_dir / name)
-            saved.append(name)
-        return saved
-
-    async def _create_job(
-        self, event: AstrMessageEvent, extra: str
-    ) -> tuple[dict, Path]:
-        job_id, session_id, job_dir, now = self._new_job_dir()
-
-        inputs = await self._save_images(event, job_dir)
-        if inputs:
-            # 同条消息自带图片时优先使用它，并清掉可能残留的旧图，避免下次串图。
-            self._discard_pending_images(event)
-        else:
-            inputs = self._consume_pending_images(event, job_dir)
-            if inputs:
-                logger.info(
-                    f"[grok] consumed pending images={len(inputs)} key={self._pending_key(event)}"
-                )
-        job = self._write_job(job_id, session_id, job_dir, now, extra, inputs)
-        return job, job_dir
-
-    async def _create_job_from_staging(
-        self, extra: str, staging_dir: Path | None
-    ) -> tuple[dict, Path]:
-        """等图 finalize：无 live 图片 event，仅从 staging 取图。"""
-        job_id, session_id, job_dir, now = self._new_job_dir()
-        inputs = self._copy_staging_inputs(staging_dir, job_dir)
-        job = self._write_job(job_id, session_id, job_dir, now, extra, inputs)
         return job, job_dir
 
     def _workbench_store(self):
