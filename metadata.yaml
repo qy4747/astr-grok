@@ -1,5 +1,5 @@
 name: astrbot_plugin_grok
 desc: 用 /grok 建 Job；/grokbot 交给 Bot；/grok暂存 只入库。支持图先命令后、同条图文、以及命令先发再等图。
-version: 1.2.6
+version: 1.2.7
 author: shenqing74-cyber
 repo: ""
